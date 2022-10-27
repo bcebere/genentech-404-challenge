@@ -3,6 +3,7 @@ from torch import nn
 import torch
 import random
 import numpy as np
+import pandas as pd
 
 from mlp import MLP
 from pydantic import validate_arguments
@@ -37,9 +38,9 @@ class TimeSeriesImputer(nn.Module):
     def __init__(
         self,
         n_units_in: int,
-        n_units_mask_in: int,
-        n_units_hidden: int = 100,
-        n_layers_hidden: int = 2,
+        n_units_out: int,
+        n_units_hidden: int = 200,
+        n_layers_hidden: int = 1,
         n_iter: int = 2500,
         mode: str = "RNN",
         n_iter_print: int = 10,
@@ -55,6 +56,7 @@ class TimeSeriesImputer(nn.Module):
         clipping_value: int = 1,
         patience: int = 20,
         train_ratio: float = 0.8,
+        residual: bool = False,
     ) -> None:
         super(TimeSeriesImputer, self).__init__()
 
@@ -66,7 +68,6 @@ class TimeSeriesImputer(nn.Module):
         self.n_iter_print = n_iter_print
         self.batch_size = batch_size
         self.n_units_in = n_units_in
-        self.n_units_mask_in = n_units_mask_in
         self.n_units_hidden = n_units_hidden
         self.n_layers_hidden = n_layers_hidden
         self.device = device
@@ -78,7 +79,7 @@ class TimeSeriesImputer(nn.Module):
         self.random_state = random_state
 
         self.temporal_layer = TimeSeriesLayer(
-            n_units_in=n_units_in + n_units_mask_in,
+            n_units_in=n_units_in,
             n_units_out=n_units_hidden,
             n_units_hidden=n_units_hidden,
             n_layers_hidden=n_layers_hidden,
@@ -94,14 +95,17 @@ class TimeSeriesImputer(nn.Module):
         self.out_layer = MLP(
             task_type="regression",
             n_units_in=n_units_hidden + 1,  # latent + VISCODE
-            n_units_out=n_units_in,
+            n_units_out=n_units_out,
             n_layers_hidden=n_layers_hidden,
             n_units_hidden=n_units_hidden,
             dropout=dropout,
             nonlin=nonlin,
             device=device,
             nonlin_out=nonlin_out,
+            residual=residual,
         )
+        self.loss = nn.MSELoss()
+        self.nonlin_out = nonlin_out
 
         self.optimizer = torch.optim.Adam(
             self.parameters(),
@@ -112,27 +116,96 @@ class TimeSeriesImputer(nn.Module):
     def forward(
         self,
         data: torch.Tensor,
-        mask: torch.Tensor,
         viscode: torch.Tensor,
     ) -> torch.Tensor:
         # x shape (batch, time_step, input_size)
         # r_out shape (batch, time_step, output_size)
 
         assert torch.isnan(data).sum() == 0
-        assert torch.isnan(mask).sum() == 0
-        assert len(data) == len(mask)
-        assert len(data) == len(viscode)
         viscode = viscode.squeeze()
         viscode = viscode.unsqueeze(1)
 
-        data_merged = torch.cat([data, mask], dim=2)
-
-        assert torch.isnan(data_merged).sum() == 0
-
-        pred = self.temporal_layer(data_merged)
+        pred = self.temporal_layer(data)
+        pred = torch.repeat_interleave(pred, len(viscode), dim=0)
         pred_merged = torch.cat([viscode, pred], dim=1)
 
         return self.out_layer(pred_merged)
+
+    @validate_arguments(config=dict(arbitrary_types_allowed=True))
+    def fit(
+        self,
+        miss_data: pd.DataFrame,
+        real_data: pd.DataFrame,
+    ) -> Any:
+        assert len(miss_data) == len(real_data)
+
+        miss_data = miss_data.sort_values(["RID_HASH", "VISCODE"])
+        real_data = real_data.sort_values(["RID_HASH", "VISCODE"])
+
+        patient_ids = miss_data["RID_HASH"].unique()
+
+        batches = []
+        for rid in patient_ids:
+            patient_miss = miss_data[miss_data["RID_HASH"] == rid]
+            patient_gt = real_data[real_data["RID_HASH"] == rid]
+
+            viscode = patient_gt["VISCODE"]
+            patient_miss = patient_miss.drop(columns=["RID_HASH"])
+            patient_miss = np.expand_dims(patient_miss.values, axis=0)
+
+            patient_gt = patient_gt.drop(columns=["RID_HASH", "VISCODE"])
+            patient_gt = np.expand_dims(patient_gt.values, axis=0)
+
+            patient_miss_t = self._check_tensor(patient_miss).float()
+            patient_gt_t = self._check_tensor(patient_gt).float()
+            viscode_t = self._check_tensor(viscode).float()
+
+            assert len(patient_miss_t) == len(patient_gt_t)
+            assert len(viscode_t) == patient_gt_t.shape[1]
+
+            batches.append((patient_miss_t, patient_gt_t, viscode_t))
+
+        for epoch in range(self.n_iter):
+            losses = []
+            for patient_miss_t, patient_gt_t, viscode_t in batches:
+                self.optimizer.zero_grad()
+
+                preds = self(patient_miss_t, viscode_t)
+
+                patient_gt_t = patient_gt_t.squeeze()
+                if self.nonlin_out is None:
+                    loss = nn.MSELoss()(preds, patient_gt_t)
+                else:
+                    loss = 0
+                    split = 0
+                    for activation, step in self.nonlin_out:
+                        if activation == "softmax":
+                            loss_fn = nn.CrossEntropyLoss()
+                        else:
+                            loss_fn = nn.MSELoss()
+                        loss += loss_fn(
+                            preds[:, split : split + step],
+                            patient_gt_t[:, split : split + step],
+                        )
+
+                        split += step
+
+                loss.backward()  # backpropagation, compute gradients
+
+                if self.clipping_value > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.parameters(), self.clipping_value
+                    )
+                self.optimizer.step()  # apply gradients
+                losses.append(loss.item())
+            print(f"Epoch {epoch} loss {np.mean(losses)}")
+        return self
+
+    def _check_tensor(self, X: torch.Tensor) -> torch.Tensor:
+        if isinstance(X, torch.Tensor):
+            return X.to(self.device)
+        else:
+            return torch.from_numpy(np.asarray(X)).to(self.device)
 
 
 class TimeSeriesLayer(nn.Module):
@@ -198,7 +271,7 @@ class TimeSeriesLayer(nn.Module):
                 task_type="regression",
                 n_units_in=n_units_hidden * n_layers_hidden,
                 n_units_out=n_units_out,
-                n_layers_hidden=n_layers_hidden,
+                n_layers_hidden=1,
                 n_units_hidden=n_units_hidden,
                 dropout=dropout,
                 nonlin=nonlin,
@@ -209,7 +282,7 @@ class TimeSeriesLayer(nn.Module):
                 task_type="regression",
                 n_units_in=n_units_hidden,
                 n_units_out=n_units_out,
-                n_layers_hidden=n_layers_hidden,
+                n_layers_hidden=1,
                 n_units_hidden=n_units_hidden,
                 dropout=dropout,
                 nonlin=nonlin,

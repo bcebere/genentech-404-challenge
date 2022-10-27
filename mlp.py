@@ -215,7 +215,7 @@ class MLP(nn.Module):
         clipping_value: int = 1,
         batch_norm: bool = False,
         early_stopping: bool = True,
-        residual: bool = True,
+        residual: bool = False,
         loss: Optional[Callable] = None,
         device: Any = DEVICE,
     ) -> None:
