@@ -136,9 +136,11 @@ class MultiActivationHead(nn.Module):
 
         split = 0
         out = torch.zeros(X.shape).to(self.device)
-        for activation, step in zip(self.activations, self.activation_lengths):
-            out[:, split : split + step] = activation(X[:, split : split + step])
+        
+        assert len(X.shape) == 3
 
+        for activation, step in zip(self.activations, self.activation_lengths):
+            out[:, :, split : split + step] = activation(X[:, :, split : split + step])
             split += step
 
         return out
