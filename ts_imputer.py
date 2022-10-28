@@ -141,7 +141,7 @@ class TimeSeriesImputer(nn.Module):
         miss_data = miss_data.sort_values(["RID_HASH", "VISCODE"])
         patient_ids = miss_data["RID_HASH"].unique()
 
-        output = pd.DataFrame([], columns = self.output_cols + ["VISCODE", "RID_HASH"])
+        output = pd.DataFrame([], columns=self.output_cols + ["VISCODE", "RID_HASH"])
 
         for rid in patient_ids:
             patient_miss = miss_data[miss_data["RID_HASH"] == rid]
@@ -156,45 +156,57 @@ class TimeSeriesImputer(nn.Module):
 
             preds = self(patient_miss_t, viscode_t).detach().cpu().numpy().squeeze()
             if len(preds.shape) == 1:
-                preds = np.expand_dims(preds, axis = 0)
+                preds = np.expand_dims(preds, axis=0)
 
-            preds = pd.DataFrame(preds, columns = self.output_cols)
+            preds = pd.DataFrame(preds, columns=self.output_cols)
             preds["VISCODE"] = viscode.squeeze()
             preds["RID_HASH"] = rid
 
-            output = pd.concat([output, preds], ignore_index = True)
-            
-            assert output.isna().sum().sum() == 0
+            output = pd.concat([output, preds], ignore_index=True)
 
+            assert output.isna().sum().sum() == 0
 
         return output
 
     @validate_arguments(config=dict(arbitrary_types_allowed=True))
     def fit(
         self,
-        miss_data: pd.DataFrame,
-        real_data: pd.DataFrame,
+        train_miss_data: pd.DataFrame,
+        train_real_data: pd.DataFrame,
+        val_miss_data: pd.DataFrame,
+        val_real_data: pd.DataFrame,
     ) -> Any:
-        assert len(miss_data) == len(real_data)
+        assert len(train_miss_data) == len(train_real_data)
 
-        miss_data = miss_data.sort_values(["RID_HASH", "VISCODE"])
-        real_data = real_data.sort_values(["RID_HASH", "VISCODE"])
+        train_miss_data = train_miss_data.sort_values(
+            ["RID_HASH", "VISCODE"]
+        ).reset_index(drop=True)
+        train_real_data = train_real_data.sort_values(
+            ["RID_HASH", "VISCODE"]
+        ).reset_index(drop=True)
 
-        patient_ids = miss_data["RID_HASH"].unique()
+        val_miss_data = val_miss_data.sort_values(["RID_HASH", "VISCODE"]).reset_index(
+            drop=True
+        )
+        val_real_data = val_real_data.sort_values(["RID_HASH", "VISCODE"]).reset_index(
+            drop=True
+        )
+
+        patient_ids = train_miss_data["RID_HASH"].unique()
 
         batches_by_size = {}
         for rid in patient_ids:
-            patient_miss = miss_data[miss_data["RID_HASH"] == rid]
-            
+            patient_miss = train_miss_data[train_miss_data["RID_HASH"] == rid]
+
             patient_seq_len = len(patient_miss)
             if patient_seq_len not in batches_by_size:
                 batches_by_size[patient_seq_len] = {
-                    "input" : [],
-                    "viscode" : [],
-                    "gt" : [],
-                        }
-            
-            patient_gt = real_data[real_data["RID_HASH"] == rid]
+                    "input": [],
+                    "viscode": [],
+                    "gt": [],
+                }
+
+            patient_gt = train_real_data[train_real_data["RID_HASH"] == rid]
             viscode = patient_gt["VISCODE"].values
             viscode = np.expand_dims(viscode, axis=0)
 
@@ -221,7 +233,7 @@ class TimeSeriesImputer(nn.Module):
             seq_miss_t = torch.cat(batches_by_size[seq_len]["input"])
             seq_viscode_t = torch.cat(batches_by_size[seq_len]["viscode"])
             seq_gt_t = torch.cat(batches_by_size[seq_len]["gt"])
-            
+
             batches.append((seq_miss_t, seq_gt_t, seq_viscode_t))
 
         batch_size = 10
@@ -229,8 +241,12 @@ class TimeSeriesImputer(nn.Module):
             losses = []
             for patient_miss_t, patient_gt_t, viscode_t in batches:
                 for idx in range(len(patient_miss_t) // batch_size):
-                    patient_miss_mb = patient_miss_t[batch_size * idx : batch_size * (idx + 1)]
-                    patient_gt_mb = patient_gt_t[batch_size * idx : batch_size * (idx + 1)]
+                    patient_miss_mb = patient_miss_t[
+                        batch_size * idx : batch_size * (idx + 1)
+                    ]
+                    patient_gt_mb = patient_gt_t[
+                        batch_size * idx : batch_size * (idx + 1)
+                    ]
                     viscode_mb = viscode_t[batch_size * idx : batch_size * (idx + 1)]
 
                     self.optimizer.zero_grad()
@@ -250,24 +266,35 @@ class TimeSeriesImputer(nn.Module):
                                 loss_fn = nn.MSELoss()
                                 factor = 100
                             local_loss = loss_fn(
-                                    preds[:, :, split : split + step],
-                                    patient_gt_mb[:, :, split : split + step],
+                                preds[:, :, split : split + step],
+                                patient_gt_mb[:, :, split : split + step],
                             )
                             loss += factor * local_loss
-                            #print(activation, step, local_loss)
+                            # print(activation, step, local_loss)
 
                             split += step
 
                     loss.backward()  # backpropagation, compute gradients
 
-                    #if self.clipping_value > 0:
-                    #    torch.nn.utils.clip_grad_norm_(
-                    #        self.parameters(), self.clipping_value
-                    #    )
+                    if self.clipping_value > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.parameters(), self.clipping_value
+                        )
                     self.optimizer.step()  # apply gradients
                     losses.append(loss.item())
             if (epoch + 1) % 50 == 0:
-                print(f"Epoch {epoch} loss {np.mean(losses)}", flush = True)
+                val_preds = (
+                    self.predict(val_miss_data).drop(columns=["RID_HASH"]).values
+                )
+                val_gt = val_real_data.drop(columns=["RID_HASH"]).values
+
+                val_loss = nn.MSELoss()(
+                    torch.from_numpy(val_preds), torch.from_numpy(val_gt)
+                ).item()
+                print(
+                    f"   >>> Epoch {epoch} train loss {np.mean(losses)} val loss {val_loss}",
+                    flush=True,
+                )
         return self
 
     def _check_tensor(self, X: torch.Tensor) -> torch.Tensor:
