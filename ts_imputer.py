@@ -21,8 +21,6 @@ modes = [
     "GRU",
     "RNN",
     "Transformer",
-    "ResCNN",
-    "TCN",
     "XceptionTime",
 ]
 
@@ -43,18 +41,17 @@ class TimeSeriesImputer(nn.Module):
         n_layers_hidden: int = 1,
         n_iter: int = 2500,
         mode: str = "RNN",
-        n_iter_print: int = 10,
+        n_iter_print: int = 50,
         batch_size: int = 100,
         lr: float = 1e-3,
         weight_decay: float = 1e-3,
         device: Any = DEVICE,
         nonlin_out: Optional[List[Tuple[str, int]]] = None,
-        loss: Optional[Callable] = None,
         dropout: float = 0,
-        nonlin: Optional[str] = "relu",
+        nonlin: Optional[str] = "leaky_relu",
         random_state: int = 0,
         clipping_value: int = 1,
-        patience: int = 20,
+        patience: int = 10,
         train_ratio: float = 0.8,
         residual: bool = False,
     ) -> None:
@@ -166,6 +163,10 @@ class TimeSeriesImputer(nn.Module):
 
             assert output.isna().sum().sum() == 0
 
+        output.index = miss_data.index
+        out_cols = ["RID_HASH", "VISCODE"] + self.output_cols
+        output = output[out_cols]
+
         return output
 
     @validate_arguments(config=dict(arbitrary_types_allowed=True))
@@ -236,8 +237,13 @@ class TimeSeriesImputer(nn.Module):
 
             batches.append((seq_miss_t, seq_gt_t, seq_viscode_t))
 
-        batch_size = 10
+        batch_size = self.batch_size
+
+        patience = 0
+        best_val_loss = 999
+
         for epoch in range(self.n_iter):
+            self.train()
             losses = []
             for patient_miss_t, patient_gt_t, viscode_t in batches:
                 for idx in range(len(patient_miss_t) // batch_size):
@@ -282,19 +288,35 @@ class TimeSeriesImputer(nn.Module):
                         )
                     self.optimizer.step()  # apply gradients
                     losses.append(loss.item())
-            if (epoch + 1) % 50 == 0:
-                val_preds = (
-                    self.predict(val_miss_data).drop(columns=["RID_HASH"]).values
-                )
-                val_gt = val_real_data.drop(columns=["RID_HASH"]).values
+            if (epoch + 1) % self.n_iter_print == 0:
+                self.eval()
+                gt_cols = list(val_real_data.columns)
+                with torch.no_grad():
+                    val_preds = (
+                        self.predict(val_miss_data)[gt_cols].drop(columns=["RID_HASH"]).values.astype(float)
+                    )
+                    val_gt = val_real_data.drop(columns=["RID_HASH"]).values.astype(float)
 
-                val_loss = nn.MSELoss()(
-                    torch.from_numpy(val_preds), torch.from_numpy(val_gt)
-                ).item()
+                    val_loss = nn.MSELoss()(
+                        torch.from_numpy(val_preds), torch.from_numpy(val_gt)
+                    ).item()
+
+                if val_loss < best_val_loss:
+                    patience = 0
+                    best_val_loss = val_loss
+                else:
+                    patience += 1
+
+                if patience > self.patience:
+                    #print(f"   >>> Epoch {epoch} Early stopping...")
+                    break
+
                 print(
                     f"   >>> Epoch {epoch} train loss {np.mean(losses)} val loss {val_loss}",
                     flush=True,
                 )
+
+        self.eval()
         return self
 
     def _check_tensor(self, X: torch.Tensor) -> torch.Tensor:
@@ -365,7 +387,7 @@ class TimeSeriesLayer(nn.Module):
         if mode in ["RNN", "LSTM", "GRU"]:
             self.out_layer = MLP(
                 task_type="regression",
-                n_units_in=n_units_hidden * n_layers_hidden,
+                n_units_in=n_units_hidden,
                 n_units_out=n_units_out,
                 n_layers_hidden=1,
                 n_units_hidden=n_units_hidden,
@@ -393,11 +415,12 @@ class TimeSeriesLayer(nn.Module):
     def forward(self, temporal_data: torch.Tensor) -> torch.Tensor:
         if self.mode in ["RNN", "LSTM", "GRU"]:
             X_interm, _ = self.temporal_layer(temporal_data)
-            X_interm = X_interm[:, -self.n_layers_hidden :, :].reshape(
-                -1, self.n_layers_hidden * self.n_units_hidden
+            X_interm = X_interm[:, -1 :, :].reshape(
+                -1, self.n_units_hidden
             )
         else:
             X_interm = self.temporal_layer(torch.swapaxes(temporal_data, 1, 2))
+
 
         assert torch.isnan(X_interm).sum() == 0
 
