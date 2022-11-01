@@ -25,6 +25,11 @@ modes = [
 ]
 
 
+REG_FACTOR_STATIC = 73
+REG_FACTOR_TEMPORAL = 64
+STATIC_LOSS_FACTOR = 7
+
+
 def enable_reproducible_results(seed: int = 0) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -249,11 +254,17 @@ class TimeSeriesImputer(nn.Module):
 
         return output
 
-    def eval_loss(self, preds, gt, nonlin_out=None, debug=False):
+    def eval_loss(self, preds, gt, nonlin_out=None, debug=False, reg_factor: int = 1):
+        clf_losses = []
+        reg_losses = []
+        loss = torch.tensor(0).to(self.device).float()
+
+        if preds.shape[-1] == 0:
+            return loss, np.mean(clf_losses), np.mean(reg_losses)
+
         if nonlin_out is None:
             loss = nn.HuberLoss()(preds, gt)
         else:
-            loss = 0
             split = 0
 
             sanity_size = 0
@@ -262,24 +273,29 @@ class TimeSeriesImputer(nn.Module):
 
             assert sanity_size == preds.shape[-1]
             assert sanity_size == gt.shape[-1]
-
             for activation, step in nonlin_out:
                 if activation == "softmax":
                     loss_fn = nn.CrossEntropyLoss()
                     factor = 1
                 else:
                     loss_fn = nn.HuberLoss()
-                    factor = 100
+                    factor = reg_factor
                 local_loss = loss_fn(
                     preds[..., split : split + step],
                     gt[..., split : split + step],
                 )
+                if activation == "softmax":
+                    clf_losses.append(local_loss.item())
+                else:
+                    reg_losses.append(local_loss.item())
+
                 if debug:
                     print(activation, step, factor * local_loss)
                 loss += factor * local_loss
 
                 split += step
-        return loss
+
+        return loss, np.mean(clf_losses), np.mean(reg_losses)
 
     @validate_arguments(config=dict(arbitrary_types_allowed=True))
     def fit(
@@ -338,6 +354,7 @@ class TimeSeriesImputer(nn.Module):
             patient_gt_static = patient_gt_static.drop_duplicates("RID_HASH")
 
             viscode = patient_gt_temporal["VISCODE"].values
+
             viscode = np.expand_dims(viscode, axis=0)
 
             patient_miss = patient_miss.drop(columns=["RID_HASH"])
@@ -358,6 +375,7 @@ class TimeSeriesImputer(nn.Module):
             viscode_t = self._check_tensor(viscode).float()
 
             assert viscode_t.shape[1] == patient_gt_temporal_t.shape[1]
+            assert viscode_t.shape[1] > 0, patient_gt_temporal
 
             batches_by_size[patient_seq_len]["input"].append(patient_miss_t)
             batches_by_size[patient_seq_len]["viscode"].append(viscode_t)
@@ -384,6 +402,13 @@ class TimeSeriesImputer(nn.Module):
             self.train()
             losses_static = []
             losses_temporal = []
+
+            losses_static_clf = []
+            losses_temporal_clf = []
+
+            losses_static_reg = []
+            losses_temporal_reg = []
+
             for (
                 patient_miss_t,
                 patient_gt_static_t,
@@ -397,16 +422,22 @@ class TimeSeriesImputer(nn.Module):
                 assert static_preds.shape == patient_gt_static_t.shape
                 assert temporal_preds.shape == patient_gt_temporal_t.shape
 
-                loss_static = self.eval_loss(
-                    static_preds, patient_gt_static_t, nonlin_out=self.nonlin_out_static
+                loss_static, loss_clf_static, loss_reg_static = self.eval_loss(
+                    static_preds,
+                    patient_gt_static_t,
+                    nonlin_out=self.nonlin_out_static,
+                    reg_factor=REG_FACTOR_STATIC,
                 )
-                loss_temporal = self.eval_loss(
+                loss_temporal, loss_clf_temporal, loss_reg_temporal = self.eval_loss(
                     temporal_preds,
                     patient_gt_temporal_t,
                     nonlin_out=self.nonlin_out_temporal,
+                    reg_factor=REG_FACTOR_TEMPORAL,
                 )
 
-                loss = loss_static + loss_temporal
+                loss = STATIC_LOSS_FACTOR * loss_static + loss_temporal
+                assert not torch.isnan(loss)
+
                 loss.backward()  # backpropagation, compute gradients
 
                 if self.clipping_value > 0:
@@ -416,6 +447,12 @@ class TimeSeriesImputer(nn.Module):
                 self.optimizer.step()  # apply gradients
                 losses_static.append(loss_static.item())
                 losses_temporal.append(loss_temporal.item())
+
+                losses_static_clf.append(loss_clf_static)
+                losses_temporal_clf.append(loss_clf_temporal)
+
+                losses_static_reg.append(loss_reg_static)
+                losses_temporal_reg.append(loss_reg_temporal)
 
             if (epoch + 1) % self.n_iter_print == 0:
                 self.eval()
@@ -442,17 +479,22 @@ class TimeSeriesImputer(nn.Module):
                         columns=["RID_HASH", "VISCODE"]
                     ).values.astype(float)
 
-                    val_loss_static = self.eval_loss(
+                    val_loss_static, _, _ = self.eval_loss(
                         torch.from_numpy(val_preds_static),
                         torch.from_numpy(val_gt_static),
                         nonlin_out=self.nonlin_out_static,
-                    ).item()
-                    val_loss_temporal = self.eval_loss(
+                        reg_factor=REG_FACTOR_STATIC,
+                    )
+                    val_loss_static = val_loss_static.item()
+                    val_loss_temporal, _, _ = self.eval_loss(
                         torch.from_numpy(val_preds_temporal),
                         torch.from_numpy(val_gt_temporal),
                         nonlin_out=self.nonlin_out_temporal,
-                    ).item()
-                    val_loss = val_loss_static + val_loss_temporal
+                        reg_factor=REG_FACTOR_TEMPORAL,
+                    )
+                    val_loss_temporal = val_loss_temporal.item()
+
+                    val_loss = STATIC_LOSS_FACTOR * val_loss_static + val_loss_temporal
 
                 if val_loss < best_val_loss:
                     patience = 0
@@ -468,6 +510,7 @@ class TimeSeriesImputer(nn.Module):
                     f"   >>> Epoch {epoch} train loss static = {np.mean(losses_static)}, temporal = {np.mean(losses_temporal)}. val loss static = {val_loss_static}, temporal = {val_loss_temporal}",
                     flush=True,
                 )
+                # print(f"  >>> Clf static loss {np.mean(losses_static_clf)} reg static loss {np.mean(losses_static_reg)} clf temp loss {np.mean(losses_temporal_clf)} reg temp loss {np.mean(losses_temporal_reg)}")
 
         self.eval()
         return self
