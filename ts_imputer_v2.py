@@ -23,17 +23,17 @@ class TimeSeriesImputerTemporal(nn.Module):
     @validate_arguments(config=dict(arbitrary_types_allowed=True))
     def __init__(
         self,
+        task_type: str,
         n_units_in: int,
         n_units_out: int,
         n_units_hidden: int = 100,
         n_layers_hidden: int = 2,
         n_iter: int = 2500,
         n_iter_print: int = 100,
-        batch_size: int = 100,
+        batch_size: int = 500,
         lr: float = 1e-3,
         weight_decay: float = 1e-3,
         device: Any = DEVICE,
-        nonlin_out: Optional[List[Tuple[str, int]]] = None,
         dropout: float = 0,
         nonlin: Optional[str] = "relu",
         random_state: int = 0,
@@ -45,10 +45,12 @@ class TimeSeriesImputerTemporal(nn.Module):
 
         enable_reproducible_results(random_state)
 
+        self.task_type = task_type
         self.n_iter = n_iter
         self.n_iter_print = n_iter_print
         self.batch_size = batch_size
         self.n_units_in = n_units_in
+        self.n_units_out = n_units_out
         self.n_units_hidden = n_units_hidden
         self.n_layers_hidden = n_layers_hidden
         self.device = device
@@ -70,17 +72,15 @@ class TimeSeriesImputerTemporal(nn.Module):
 
         self.layer_out = MLP(
             task_type="regression",
-            n_units_in=n_units_hidden + 1,  # latent + VISCODE
+            n_units_in=n_units_hidden,  # latent + VISCODE
             n_units_out=n_units_out,
             n_layers_hidden=n_layers_hidden,
             n_units_hidden=n_units_hidden,
             dropout=dropout,
             nonlin=nonlin,
             device=device,
-            nonlin_out=nonlin_out,
             residual=residual,
         ).to(DEVICE)
-        self.nonlin_out = nonlin_out
 
         self.optimizer = torch.optim.Adam(
             self.parameters(),
@@ -88,13 +88,19 @@ class TimeSeriesImputerTemporal(nn.Module):
             weight_decay=weight_decay,
         )  # optimize all rnn parameters
 
-    def forward_latent(
-        self, data: torch.Tensor, horizons: torch.Tensor
-    ) -> torch.Tensor:
+    def forward_latent(self, data: torch.Tensor, viscode: torch.Tensor) -> torch.Tensor:
         assert torch.isnan(data).sum() == 0
-        return self.layer_latent(
-            torch.swapaxes(data, 1, 2), horizons
+
+        encoded_viscode = self.layer_latent.pos_encoder(viscode)
+        encoded_viscode = encoded_viscode.swapaxes(0, 1)
+
+        pred = self.layer_latent(
+            torch.swapaxes(data, 1, 2), viscode
         )  # bs x seq_len x feats -> bs x feats x seq_len
+        pred = pred.unsqueeze(1)
+        pred = torch.repeat_interleave(pred, viscode.shape[1], dim=1)
+
+        return pred + encoded_viscode
 
     def forward(
         self,
@@ -102,20 +108,14 @@ class TimeSeriesImputerTemporal(nn.Module):
         viscode: torch.Tensor,
     ) -> torch.Tensor:
         assert torch.isnan(data).sum() == 0
-        pred = self.forward_latent(data, viscode)
-
-        viscode = viscode.unsqueeze(-1)
-        pred = pred.unsqueeze(1)
-        pred = torch.repeat_interleave(pred, viscode.shape[1], dim=1)
-
-        pred_merged = torch.cat([viscode, pred], dim=2)
-
-        return self.layer_out(pred_merged)
+        latent = self.forward_latent(data, viscode)
+        return self.layer_out(latent)
 
     @validate_arguments(config=dict(arbitrary_types_allowed=True))
     def predict(
         self,
         miss_data: pd.DataFrame,
+        proba: bool = False,
     ) -> Any:
         self.eval()
         miss_data = miss_data.copy()
@@ -123,7 +123,10 @@ class TimeSeriesImputerTemporal(nn.Module):
         miss_data = miss_data.sort_values(["RID_HASH", "VISCODE"])
         patient_ids = miss_data["RID_HASH"].unique()
 
-        output = pd.DataFrame([], columns=self.output_cols + ["VISCODE", "RID_HASH"])
+        output_cols = self.output_cols
+        if proba:
+            output_cols = list(range(self.n_units_out))
+        output = pd.DataFrame([], columns=output_cols + ["VISCODE", "RID_HASH"])
 
         for rid in patient_ids:
             patient_miss = miss_data[miss_data["RID_HASH"] == rid]
@@ -142,7 +145,10 @@ class TimeSeriesImputerTemporal(nn.Module):
             viscode = viscode[0]
             assert len(temporal_preds) == len(viscode)
 
-            temporal_preds = pd.DataFrame(temporal_preds, columns=self.output_cols)
+            if self.task_type == "classification" and not proba:
+                temporal_preds = np.argmax(temporal_preds, -1)
+
+            temporal_preds = pd.DataFrame(temporal_preds, columns=output_cols)
             temporal_preds["VISCODE"] = viscode.squeeze()
             temporal_preds["RID_HASH"] = rid
 
@@ -151,7 +157,7 @@ class TimeSeriesImputerTemporal(nn.Module):
             assert output.isna().sum().sum() == 0
 
         output.index = miss_data.index
-        output = output[["RID_HASH", "VISCODE"] + self.output_cols]
+        output = output[["RID_HASH", "VISCODE"] + output_cols]
 
         return output
 
@@ -171,13 +177,22 @@ class TimeSeriesImputerTemporal(nn.Module):
 
         for rid in patient_ids:
             patient_miss = miss_data[miss_data["RID_HASH"] == rid]
+            viscode = patient_miss["VISCODE"].values
+            viscode = np.expand_dims(viscode, axis=0)
 
             patient_miss = patient_miss.drop(columns=["RID_HASH"])
             patient_miss = np.expand_dims(patient_miss.values, axis=0)
 
             patient_miss_t = self._check_tensor(patient_miss).float()
+            viscode_t = self._check_tensor(viscode).float()
 
-            preds = self.forward_latent(patient_miss_t).detach().cpu().numpy().squeeze()
+            preds = (
+                self.forward_latent(patient_miss_t, viscode_t)
+                .detach()
+                .cpu()
+                .numpy()
+                .squeeze()
+            )
             if len(preds.shape) == 1:
                 preds = np.expand_dims(preds, axis=0)
 
@@ -188,52 +203,34 @@ class TimeSeriesImputerTemporal(nn.Module):
 
             assert output.isna().sum().sum() == 0
 
+        output.index = miss_data.index
         output = output[out_cols]
 
         return output
 
-    def eval_loss(self, preds, gt, nonlin_out=None, debug=False):
+    def eval_loss(self, preds, gt, custom_loss=None):
         loss = torch.tensor(0).to(self.device).float()
 
         if preds.shape[-1] == 0:
             return loss
 
-        if nonlin_out is None:
-            loss = nn.HuberLoss()(preds, gt)
+        if self.task_type == "classification":
+            return nn.CrossEntropyLoss()(
+                preds.reshape(-1, preds.shape[-1]),
+                gt.reshape(-1, gt.shape[-1]).squeeze().long(),
+            )
         else:
-            split = 0
-
-            sanity_size = 0
-            for _, step in nonlin_out:
-                sanity_size += step
-
-            assert sanity_size == preds.shape[-1]
-            assert sanity_size == gt.shape[-1]
-            for activation, step in nonlin_out:
-                if activation == "softmax":
-                    loss_fn = nn.CrossEntropyLoss()
-                else:
-                    loss_fn = nn.HuberLoss()
-                local_loss = loss_fn(
-                    preds[..., split : split + step],
-                    gt[..., split : split + step],
-                )
-
-                if debug:
-                    print(activation, step, local_loss)
-                loss += local_loss
-
-                split += step
-
-        return loss
+            return nn.HuberLoss()(preds, gt)
 
     @validate_arguments(config=dict(arbitrary_types_allowed=True))
     def fit(
         self,
         train_miss_data: pd.DataFrame,
         train_real_data: pd.DataFrame,
+        train_target_mask: pd.DataFrame,
         val_miss_data: pd.DataFrame,
         val_real_data: pd.DataFrame,
+        val_target_mask: pd.DataFrame,
     ) -> Any:
         assert len(train_miss_data) == len(train_real_data)
 
@@ -243,6 +240,9 @@ class TimeSeriesImputerTemporal(nn.Module):
         train_real_data = train_real_data.sort_values(
             ["RID_HASH", "VISCODE"]
         ).reset_index(drop=True)
+        train_target_mask = train_target_mask.sort_values(
+            ["RID_HASH", "VISCODE"]
+        ).reset_index(drop=True)
 
         val_miss_data = val_miss_data.sort_values(["RID_HASH", "VISCODE"]).reset_index(
             drop=True
@@ -250,6 +250,9 @@ class TimeSeriesImputerTemporal(nn.Module):
         val_real_data = val_real_data.sort_values(["RID_HASH", "VISCODE"]).reset_index(
             drop=True
         )
+        val_target_mask = val_target_mask.sort_values(
+            ["RID_HASH", "VISCODE"]
+        ).reset_index(drop=True)
 
         patient_ids = train_miss_data["RID_HASH"].unique()
 
@@ -263,9 +266,11 @@ class TimeSeriesImputerTemporal(nn.Module):
                     "input": [],
                     "viscode": [],
                     "gt": [],
+                    "target_mask": [],
                 }
 
             patient_gt = train_real_data[train_real_data["RID_HASH"] == rid]
+            target_mask = train_target_mask[train_target_mask["RID_HASH"] == rid]
 
             viscode = patient_gt["VISCODE"].values
 
@@ -275,28 +280,36 @@ class TimeSeriesImputerTemporal(nn.Module):
             patient_miss = np.expand_dims(patient_miss.values, axis=0)
 
             patient_gt = patient_gt.drop(columns=["RID_HASH", "VISCODE"])
+            target_mask = target_mask.drop(columns=["RID_HASH", "VISCODE"])
 
             self.output_cols = list(patient_gt.columns)
             patient_gt = np.expand_dims(patient_gt.values, axis=0)
+            target_mask = np.expand_dims(target_mask.values, axis=0)
 
             patient_miss_t = self._check_tensor(patient_miss).float()
             patient_gt_t = self._check_tensor(patient_gt).float()
             viscode_t = self._check_tensor(viscode).float()
+            target_mask_t = self._check_tensor(target_mask).bool()
 
             assert viscode_t.shape[1] == patient_gt.shape[1]
             assert viscode_t.shape[1] > 0, patient_gt
+            assert target_mask_t.shape == patient_gt.shape
 
             batches_by_size[patient_seq_len]["input"].append(patient_miss_t)
             batches_by_size[patient_seq_len]["viscode"].append(viscode_t)
             batches_by_size[patient_seq_len]["gt"].append(patient_gt_t)
+            batches_by_size[patient_seq_len]["target_mask"].append(target_mask_t)
 
         batches = []
         for seq_len in batches_by_size:
             seq_miss_t = torch.cat(batches_by_size[seq_len]["input"])
             seq_viscode_t = torch.cat(batches_by_size[seq_len]["viscode"])
             seq_gt_temporal_t = torch.cat(batches_by_size[seq_len]["gt"])
+            seq_target_mask_t = torch.cat(batches_by_size[seq_len]["target_mask"])
 
-            batches.append((seq_miss_t, seq_gt_temporal_t, seq_viscode_t))
+            batches.append(
+                (seq_miss_t, seq_gt_temporal_t, seq_viscode_t, seq_target_mask_t)
+            )
 
         patience = 0
         best_val_loss = 999
@@ -309,18 +322,29 @@ class TimeSeriesImputerTemporal(nn.Module):
                 patient_miss_t,
                 patient_gt_temporal_t,
                 viscode_t,
+                target_mask_t,
             ) in batches:
                 self.optimizer.zero_grad()
 
                 temporal_preds = self(patient_miss_t, viscode_t)
 
-                assert temporal_preds.shape == patient_gt_temporal_t.shape
+                assert temporal_preds.shape[0] == patient_gt_temporal_t.shape[0]
 
-                loss = self.eval_loss(
+                seq_len = temporal_preds.shape[1]
+
+                loss = seq_len * self.eval_loss(
                     temporal_preds,
                     patient_gt_temporal_t,
-                    nonlin_out=self.nonlin_out,
                 )
+                if self.task_type != "classification" and target_mask_t.sum() > 0:
+                    loss += (
+                        10
+                        * seq_len
+                        * nn.MSELoss()(
+                            temporal_preds[target_mask_t],
+                            patient_gt_temporal_t[target_mask_t],
+                        )
+                    )
 
                 assert not torch.isnan(loss)
 
@@ -335,12 +359,11 @@ class TimeSeriesImputerTemporal(nn.Module):
 
             if (epoch + 1) % self.n_iter_print == 0:
                 self.eval()
-                gt_cols = list(val_real_data.columns)
 
                 with torch.no_grad():
-                    val_preds = self.predict(val_miss_data)
+                    val_preds = self.predict(val_miss_data, proba = True)
                     val_preds = (
-                        val_preds[gt_cols]
+                        val_preds
                         .drop(columns=["RID_HASH", "VISCODE"])
                         .values.astype(float)
                     )
@@ -352,8 +375,17 @@ class TimeSeriesImputerTemporal(nn.Module):
                     val_loss = self.eval_loss(
                         torch.from_numpy(val_preds),
                         torch.from_numpy(val_gt),
-                        nonlin_out=self.nonlin_out,
                     )
+                    val_mask = val_target_mask.drop(
+                        columns=["RID_HASH", "VISCODE"]
+                    ).values.astype(bool)
+                    val_mask = torch.from_numpy(val_mask)
+
+                    if self.task_type != "classification":
+                        val_loss += 10 * nn.MSELoss()(
+                            torch.from_numpy(val_preds)[val_mask],
+                            torch.from_numpy(val_gt)[val_mask],
+                        )
                     val_loss = val_loss.item()
 
                 if val_loss < best_val_loss:
