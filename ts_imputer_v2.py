@@ -361,12 +361,10 @@ class TimeSeriesImputerTemporal(nn.Module):
                 self.eval()
 
                 with torch.no_grad():
-                    val_preds = self.predict(val_miss_data, proba = True)
-                    val_preds = (
-                        val_preds
-                        .drop(columns=["RID_HASH", "VISCODE"])
-                        .values.astype(float)
-                    )
+                    val_preds = self.predict(val_miss_data, proba=True)
+                    val_preds = val_preds.drop(
+                        columns=["RID_HASH", "VISCODE"]
+                    ).values.astype(float)
 
                     val_gt = val_real_data.drop(
                         columns=["RID_HASH", "VISCODE"]
@@ -381,7 +379,7 @@ class TimeSeriesImputerTemporal(nn.Module):
                     ).values.astype(bool)
                     val_mask = torch.from_numpy(val_mask)
 
-                    if self.task_type != "classification":
+                    if self.task_type != "classification" and val_mask.sum() > 0:
                         val_loss += 10 * nn.MSELoss()(
                             torch.from_numpy(val_preds)[val_mask],
                             torch.from_numpy(val_gt)[val_mask],
