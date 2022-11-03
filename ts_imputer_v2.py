@@ -35,7 +35,7 @@ class TimeSeriesImputerTemporal(nn.Module):
         device: Any = DEVICE,
         nonlin_out: Optional[List[Tuple[str, int]]] = None,
         dropout: float = 0,
-        nonlin: Optional[str] = "leaky_relu",
+        nonlin: Optional[str] = "relu",
         random_state: int = 0,
         clipping_value: int = 1,
         patience: int = 5,
@@ -58,7 +58,7 @@ class TimeSeriesImputerTemporal(nn.Module):
         self.patience = patience
         self.random_state = random_state
 
-        self.latent_layer = Transformer(
+        self.layer_latent = Transformer(
             n_units_in=n_units_in,
             n_units_out=n_units_hidden,
             n_units_hidden=n_units_hidden,
@@ -66,7 +66,6 @@ class TimeSeriesImputerTemporal(nn.Module):
             n_layers_hidden=n_layers_hidden,
             dropout=dropout,
             activation=nonlin,
-            random_state=random_state,
         )
 
         self.layer_out = MLP(
@@ -92,10 +91,12 @@ class TimeSeriesImputerTemporal(nn.Module):
     def forward_latent(
         self,
         data: torch.Tensor,
+        horizons: torch.Tensor
     ) -> torch.Tensor:
         assert torch.isnan(data).sum() == 0
         return self.layer_latent(
-            torch.swapaxes(data, 1, 2)
+            torch.swapaxes(data, 1, 2),
+            horizons
         )  # bs x seq_len x feats -> bs x feats x seq_len
 
     def forward(
@@ -104,6 +105,7 @@ class TimeSeriesImputerTemporal(nn.Module):
         viscode: torch.Tensor,
     ) -> torch.Tensor:
         assert torch.isnan(data).sum() == 0
+        print(data.shape, viscode.shape)
         viscode = viscode.unsqueeze(-1)
 
         pred = self.forward_latent(data)
@@ -299,7 +301,7 @@ class TimeSeriesImputerTemporal(nn.Module):
         for seq_len in batches_by_size:
             seq_miss_t = torch.cat(batches_by_size[seq_len]["input"])
             seq_viscode_t = torch.cat(batches_by_size[seq_len]["viscode"])
-            seq_gt_temporal_t = torch.cat(batches_by_size[seq_len]["gt_temporal"])
+            seq_gt_temporal_t = torch.cat(batches_by_size[seq_len]["gt"])
 
             batches.append((seq_miss_t, seq_gt_temporal_t, seq_viscode_t))
 

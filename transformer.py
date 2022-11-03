@@ -9,7 +9,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout=0.1, max_len=5000):
+    def __init__(self, d_model: int = 128, dropout=0.1, max_len=5000):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
         self.scale = nn.Parameter(torch.ones(1))
@@ -25,6 +25,8 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pe", pe)
 
     def forward(self, x, horizons):
+        print(x.shape, horizons.shape)
+        raise
         x = x + self.scale * self.pe[: x.size(0), :]
         return self.dropout(x)
 
@@ -55,6 +57,8 @@ class Transformer(nn.Module):
         Input shape:
             bs (batch size) x nvars (aka variables, dimensions, channels) x seq_len (aka time steps)
         """
+        super(Transformer, self).__init__()
+
         self.permute = Permute(2, 0, 1)
         self.inlinear = nn.Linear(n_units_in, n_units_hidden)
         self.relu = nn.ReLU()
