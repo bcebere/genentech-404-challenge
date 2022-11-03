@@ -1,6 +1,6 @@
 # third party
 import torch
-import math
+import numpy as np
 from torch import nn
 from torch.nn.modules.transformer import TransformerEncoder, TransformerEncoderLayer
 from typing import Any, Optional
@@ -9,26 +9,28 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int = 128, dropout=0.1, max_len=5000):
+    def __init__(self, n_units_hidden: int, max_len: int = 500):
         super(PositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        self.scale = nn.Parameter(torch.ones(1))
+        self.max_len = max_len
+        self.n_units_hidden = n_units_hidden
+        self._num_timescales = n_units_hidden // 2
 
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        self.register_buffer("pe", pe)
+    def forward(self, horizons):
+        horizons = horizons.float()
 
-    def forward(self, x, horizons):
-        print(x.shape, horizons.shape)
-        raise
-        x = x + self.scale * self.pe[: x.size(0), :]
-        return self.dropout(x)
+        timescales = self.max_len ** np.linspace(0, 1, self._num_timescales)
+        timescales = torch.from_numpy(timescales).to(DEVICE)
+        horizons = horizons.swapaxes(0,1)
+        times = horizons.unsqueeze(2)
+
+        scaled_time = times / timescales[None, None, :]
+        # Use a 32-D embedding to represent a single time point
+        pe = torch.cat(
+            [torch.sin(scaled_time), torch.cos(scaled_time)], axis=-1
+        )  # T x B x n_units_hidden
+        pe = pe.type(torch.FloatTensor)
+
+        return pe.to(DEVICE)
 
 
 class Transformer(nn.Module):
@@ -76,14 +78,18 @@ class Transformer(nn.Module):
         self.transpose = Transpose(1, 0)
         self.max = Max(1)
         self.outlinear = nn.Linear(n_units_hidden, n_units_out)
-        self.pos_encoder = PositionalEncoding()
+        self.pos_encoder = PositionalEncoding(n_units_hidden=n_units_hidden)
 
     def forward(self, x, horizons):
+        assert len(x) == len(horizons) # same batchsize
+        assert x.shape[-1] == horizons.shape[-1] # same seq len
+
         x = self.permute(x)  # bs x nvars x seq_len -> seq_len x bs x nvars
         x = self.inlinear(x)  # seq_len x bs x nvars -> seq_len x bs x n_units_hidden
         x = self.relu(x)
 
-        x = self.pos_encoder(x, horizons)
+        pos = self.pos_encoder(horizons)
+        x = x + pos
 
         x = self.transformer_encoder(x)
         x = self.transpose(

@@ -66,7 +66,7 @@ class TimeSeriesImputerTemporal(nn.Module):
             n_layers_hidden=n_layers_hidden,
             dropout=dropout,
             activation=nonlin,
-        )
+        ).to(DEVICE)
 
         self.layer_out = MLP(
             task_type="regression",
@@ -79,7 +79,7 @@ class TimeSeriesImputerTemporal(nn.Module):
             device=device,
             nonlin_out=nonlin_out,
             residual=residual,
-        )
+        ).to(DEVICE)
         self.nonlin_out = nonlin_out
 
         self.optimizer = torch.optim.Adam(
@@ -89,14 +89,11 @@ class TimeSeriesImputerTemporal(nn.Module):
         )  # optimize all rnn parameters
 
     def forward_latent(
-        self,
-        data: torch.Tensor,
-        horizons: torch.Tensor
+        self, data: torch.Tensor, horizons: torch.Tensor
     ) -> torch.Tensor:
         assert torch.isnan(data).sum() == 0
         return self.layer_latent(
-            torch.swapaxes(data, 1, 2),
-            horizons
+            torch.swapaxes(data, 1, 2), horizons
         )  # bs x seq_len x feats -> bs x feats x seq_len
 
     def forward(
@@ -105,11 +102,9 @@ class TimeSeriesImputerTemporal(nn.Module):
         viscode: torch.Tensor,
     ) -> torch.Tensor:
         assert torch.isnan(data).sum() == 0
-        print(data.shape, viscode.shape)
+        pred = self.forward_latent(data, viscode)
+
         viscode = viscode.unsqueeze(-1)
-
-        pred = self.forward_latent(data)
-
         pred = pred.unsqueeze(1)
         pred = torch.repeat_interleave(pred, viscode.shape[1], dim=1)
 
@@ -141,15 +136,13 @@ class TimeSeriesImputerTemporal(nn.Module):
             patient_miss_t = self._check_tensor(patient_miss).float()
             viscode_t = self._check_tensor(viscode).float()
 
-            temporal_preds = self(patient_miss_t, viscode_t)
-            temporal_preds = temporal_preds.detach().cpu().numpy().squeeze()
+            temporal_preds = self(patient_miss_t, viscode_t)[0]
+            temporal_preds = temporal_preds.detach().cpu().numpy()
 
-            if len(temporal_preds.shape) == 1:
-                temporal_preds = np.expand_dims(temporal_preds, axis=0)
+            viscode = viscode[0]
+            assert len(temporal_preds) == len(viscode)
 
-            temporal_preds = pd.DataFrame(
-                temporal_preds, columns=self.output_cols_temporal
-            )
+            temporal_preds = pd.DataFrame(temporal_preds, columns=self.output_cols)
             temporal_preds["VISCODE"] = viscode.squeeze()
             temporal_preds["RID_HASH"] = rid
 
@@ -158,7 +151,7 @@ class TimeSeriesImputerTemporal(nn.Module):
             assert output.isna().sum().sum() == 0
 
         output.index = miss_data.index
-        output = output[["RID_HASH", "VISCODE"] + self.output_cols_temporal]
+        output = output[["RID_HASH", "VISCODE"] + self.output_cols]
 
         return output
 
@@ -326,7 +319,7 @@ class TimeSeriesImputerTemporal(nn.Module):
                 loss = self.eval_loss(
                     temporal_preds,
                     patient_gt_temporal_t,
-                    nonlin_out=self.nonlin_out_temporal,
+                    nonlin_out=self.nonlin_out,
                 )
 
                 assert not torch.isnan(loss)
