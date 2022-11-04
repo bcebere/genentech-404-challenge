@@ -147,11 +147,10 @@ def generate_testcase(ref_df, out_df, target_column: str, cat_thresh: int = cat_
     test_output = out_df[["RID_HASH", "VISCODE", target_column]].reset_index(drop=True)
 
     if len(dev_set[target_column].unique()) < cat_thresh:
-        encoding_data = pd.concat([dev_set, out_df, test_AB_output], ignore_index = True)
+        encoding_data = pd.concat([dev_set, out_df, test_AB_output], ignore_index=True)
         encoder = LabelEncoder().fit(encoding_data[[target_column]])
 
         test_output[target_column] = encoder.transform(out_df[[target_column]])
-
 
     return test_input, test_output, target_mask
 
@@ -208,7 +207,7 @@ def train_inputer_for_column(target_column: str, n_units_hidden: int = 150):
         # nonlin_out = activation_layout,
         n_layers_hidden=2,
         n_units_hidden=n_units_hidden,
-        n_iter=10000,
+        n_iter=200,
         residual=False,
     )
 
@@ -227,5 +226,5 @@ def train_inputer_for_column(target_column: str, n_units_hidden: int = 150):
     return imputer
 
 
-train_inputer_for_column(target_column = "WholeBrain")
-#train_inputer_for_column(target_column="DX_num")
+train_inputer_for_column(target_column="WholeBrain")
+# train_inputer_for_column(target_column="DX_num")

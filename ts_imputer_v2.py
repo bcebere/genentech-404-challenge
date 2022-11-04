@@ -1,4 +1,6 @@
+import copy
 import random
+from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 import numpy as np
@@ -6,11 +8,13 @@ import pandas as pd
 import torch
 from pydantic import validate_arguments
 from torch import nn
-from transformer import Transformer
 
 from mlp import MLP
+from transformer import Transformer
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+workspace = Path("checkpoints")
+workspace.mkdir(parents=True, exist_ok=True)
 
 
 def enable_reproducible_results(seed: int = 0) -> None:
@@ -312,7 +316,11 @@ class TimeSeriesImputerTemporal(nn.Module):
             )
 
         patience = 0
-        best_val_loss = 999
+        best_val_loss = {
+            "score": 999,
+            "model_state_dict": None,
+            "optimizer_state_dict": None,
+        }
 
         for epoch in range(self.n_iter):
             self.train()
@@ -386,9 +394,13 @@ class TimeSeriesImputerTemporal(nn.Module):
                         )
                     val_loss = val_loss.item()
 
-                if val_loss < best_val_loss:
+                if val_loss < best_val_loss["score"]:
+                    best_val_loss = {
+                        "score": val_loss,
+                        "model_state_dict": self.state_dict(),
+                        "optimizer_state_dict": self.optimizer.state_dict(),
+                    }
                     patience = 0
-                    best_val_loss = val_loss
                 else:
                     patience += 1
 
@@ -400,6 +412,9 @@ class TimeSeriesImputerTemporal(nn.Module):
                     f"   >>> Epoch {epoch} train loss  = {np.mean(losses)} val loss {val_loss}",
                     flush=True,
                 )
+        print(f"Using best val score {best_val_loss['score']}")
+        self.load_state_dict(best_val_loss["model_state_dict"])
+        self.optimizer.load_state_dict(best_val_loss["optimizer_state_dict"])
 
         self.eval()
         return self
