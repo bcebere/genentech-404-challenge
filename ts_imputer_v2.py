@@ -8,6 +8,7 @@ import pandas as pd
 import torch
 from pydantic import validate_arguments
 from torch import nn
+from hyperimpute.utils.serialization import load_model_from_file, save_model_to_file
 
 from mlp import MLP
 from transformer import Transformer
@@ -42,7 +43,7 @@ class TimeSeriesImputerTemporal(nn.Module):
         nonlin: Optional[str] = "relu",
         random_state: int = 0,
         clipping_value: int = 1,
-        patience: int = 5,
+        patience: int = 10,
         residual: bool = True,
     ) -> None:
         super(TimeSeriesImputerTemporal, self).__init__()
@@ -316,11 +317,16 @@ class TimeSeriesImputerTemporal(nn.Module):
             )
 
         patience = 0
-        best_val_loss = {
-            "score": 999,
-            "model_state_dict": None,
-            "optimizer_state_dict": None,
-        }
+        bkp_file = workspace / f"checkpoint_val_loss{id(self)}.bkp"
+
+        if bkp_file.exists():
+            best_val_loss = load_model_from_file(bkp_file)
+        else:
+            best_val_loss = {
+                "score": 999,
+                "model_state_dict": None,
+                "optimizer_state_dict": None,
+            }
 
         for epoch in range(self.n_iter):
             self.train()
@@ -412,9 +418,11 @@ class TimeSeriesImputerTemporal(nn.Module):
                     f"   >>> Epoch {epoch} train loss  = {np.mean(losses)} val loss {val_loss}",
                     flush=True,
                 )
-        print(f"Using best val score {best_val_loss['score']}")
+        print(f"   >>> Using best val score {best_val_loss['score']}")
         self.load_state_dict(best_val_loss["model_state_dict"])
         self.optimizer.load_state_dict(best_val_loss["optimizer_state_dict"])
+
+        save_model_to_file(bkp_file, best_val_loss)
 
         self.eval()
         return self
