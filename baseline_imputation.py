@@ -22,15 +22,16 @@ def prepare_consts(test_data):
             test_data.loc[test_data["RID_HASH"] == rid, col] = test_data[
                 test_data["RID_HASH"] == rid
             ][col].fillna(val)
-            assert len(local[col].unique()) == 1, col
+            assert len(local[col].unique()) == 1, local
 
     return test_data
 
 
-def prepare_age(test_data, scaler, scaled_cols):
+def prepare_age(test_data, scaler = None, scaled_cols = []):
     test_data = test_data.copy()
     test_data = test_data.sort_values(["RID_HASH", "VISCODE"])
-    test_data[scaled_cols] = scaler.inverse_transform(test_data[scaled_cols])
+    if scaler is not None:
+        test_data[scaled_cols] = scaler.inverse_transform(test_data[scaled_cols])
 
     col = "AGE"
 
@@ -92,6 +93,7 @@ def prepare_age(test_data, scaler, scaled_cols):
 
         # print(test_data[(test_data["RID_HASH"] == rid)][["VISCODE", "AGE"]])
 
-    test_data[scaled_cols] = scaler.transform(test_data[scaled_cols])
+    if scaler is not None:
+        test_data[scaled_cols] = scaler.transform(test_data[scaled_cols])
 
     return test_data
