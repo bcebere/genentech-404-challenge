@@ -1,13 +1,12 @@
----
-author:
-- 'Bogdan Cebere(User : bcebere)'
-title: |
-  Genentech -- 404 Challenge\
-  Description for Submission ID \#28855496.
----
+# Genentech 404 Challenge (Kaggle) - 6th place entry
 
-Challenge review {#section:data_checks}
-================
+
+- Competition: https://www.kaggle.com/competitions/genentech-404-challenge
+- Solution notebook: [Notebook](https://github.com/bcebere/genentech-404-challenge/blob/main/solution.ipynb)
+
+
+Challenge review
+================================
 
 Given a clinical time series dataset with missing values, complete the
 empty values. The patients are indexed by the id, and for each patient,
@@ -48,9 +47,6 @@ Dataset augmentation
 
 #### Data preprocessing
 
-: [\[section:preprocessing\]]{#section:preprocessing
-label="section:preprocessing"}
-
 1.  Sort the dataset by the tuple (\"RID\_HASH\", \"VISCODE\"). This
     speeds up the processing.
 
@@ -86,7 +82,7 @@ While some more additional augmentations would be ideal, only the
 \"total\_visits\" and \"last\_visit\" didn't affect the public test
 score.
 
-Static features {#section:static_features}
+Static features 
 ---------------
 
 While trivial, the first step of the imputation is a good sanity check.
@@ -99,7 +95,7 @@ value. More precisely, for observations $i$ and $i + 1$ for a patient,
 we use the formula
 $\text{AGE}[i + 1] = (\text{VISCODE}[i + 1] - \text{VISCODE}[i]) / 12 + \text{AGE}[i]$.
 
-Iterative Horizontal(visit-wise) imputation {#section:horizontal_imputation}
+Iterative Horizontal(visit-wise) imputation using [HyperImpute](https://github.com/vanderschaarlab/hyperimpute)
 -------------------------------------------
 
 Next, we need a method for imputing a single visit. Given a single visit
@@ -117,17 +113,14 @@ main benefits of the horizontal imputation are:
     single visit - the easiest to impute statically. Starting from that,
     the longitudinal imputer can deduct the other temporal values.
 
-For the task, we are using **HyperImpute**([@hyperimpute2022],
-[@hyperimpute2022github]), an iterative imputation algorithm, which
+For the task, we are using [**HyperImpute**](https://github.com/vanderschaarlab/hyperimpute), an iterative imputation algorithm, which
 generalizes MICE and missForest, by allowing any type of base
 learner(not just linear/random forest), and which uses AutoML to tune
-the models by column and by iteration. Figure
-[\[hyperimpute:general\_diagram\]](#hyperimpute:general_diagram){reference-type="ref"
-reference="hyperimpute:general_diagram"} shows the high-level
+the models by column and by iteration. The figure below shows the high-level
 architecture of the iterative method, which we'll extend to the
 longitudinal dimension for the current dataset.
 
-![image](img/figure.png){width="\\textwidth"}
+![image](img/figure.png)
 
 The pool of **base learners** for HyperImpute is:
 
@@ -151,12 +144,8 @@ target column, we use the rest of the features from each patient. For
 example, for target \"AGE\", we benchmark a model trained on the patient
 features without the \"AGE\" column.
 
-Table
-[\[tab:horizontal\_learners\]](#tab:horizontal_learners){reference-type="ref"
-reference="tab:horizontal_learners"} contains a snippet from the test
-set from the first imputation iteration.
 
-Iterative Longitudinal imputation {#section:longitudinal_imputation}
+Iterative Longitudinal imputation
 ---------------------------------
 
 It is important for patients with multiple visits to impute constrained
@@ -199,13 +188,6 @@ the Horizontal imputation setup, we run the AutoML logic on the
 preprocessed data, selecting the optimal AUCROC for classifiers and the
 optimal R2 score for regressors.
 
-Tables
-[\[tab:temporal\_forward\_learners\_learners\]](#tab:temporal_forward_learners_learners){reference-type="ref"
-reference="tab:temporal_forward_learners_learners"} and
-[\[tab:temporal\_reverse\_learners\_learners\]](#tab:temporal_reverse_learners_learners){reference-type="ref"
-reference="tab:temporal_reverse_learners_learners"} contain the models
-that were selected for the current solution, for the longitudinal
-imputation.
 
 Putting the pieces together
 ===========================
@@ -216,14 +198,9 @@ The complete imputation algorithm is:
 
 1.  **Constants imputation:** Impute the constants \[\"PTGENDER\_num\",
     \"PTEDUCAT\", \"APOE4\"\] and the \"AGE\" from the existing observed
-    data in $X$(discussed in Section
-    [2.2](#section:static_features){reference-type="ref"
-    reference="section:static_features"}).
+    data.
 
-2.  **Longitudinal imputation loop,** using the models from Section
-    [2.4](#section:longitudinal_imputation){reference-type="ref"
-    reference="section:longitudinal_imputation"}.
-
+2.  **Longitudinal imputation loop,**.
     1.  Create $X_{dummy}$, a support imputed version of $X$, created by
         propagating the last valid observation forward(using pandas'
         ffill) or using the next valid observation to fill the gap(using
@@ -253,9 +230,7 @@ The complete imputation algorithm is:
             unobserved for a patient. Otherwise, they would have been
             filled in the longitudinal loop.
 
-3.  **Horizontal imputation**, using the models from Section
-    [2.3](#section:horizontal_imputation){reference-type="ref"
-    reference="section:horizontal_imputation"}. We run the horizontal
+3.  **Horizontal imputation**. We run the horizontal
     imputation to fill in the missing values. For each patient, we merge
     the horizontal imputation into the rows with the *least missing
     values*. We are not using the full horizontal imputation because it
@@ -274,10 +249,5 @@ The complete imputation algorithm is:
 **Submission dataset.** For the final submission, a few extra steps are
 executed:
 
-1.  Unscale the scaled features from Section
-    [\[section:preprocessing\]](#section:preprocessing){reference-type="ref"
-    reference="section:preprocessing"}.
-
-2.  Review the Data sanity checks, as detailed in Section
-    [1](#section:data_checks){reference-type="ref"
-    reference="section:data_checks"}.
+1.  Unscale the scaled features
+2.  Review the Data sanity checks.
